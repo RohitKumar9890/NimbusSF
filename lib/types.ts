@@ -11,8 +11,11 @@ export interface FileInfo {
   name: string;
   size: number;
   uploadedAt: string;
+  ownerId: string;
   chunks: ChunkInfo[];
+  mimeType?: string;
 }
+
 
 export interface ChunkInfo {
   id: string;

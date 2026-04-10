@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import { access, mkdir, readFile, unlink, writeFile } from 'fs/promises';
 import path from 'path';
 
-import prisma from './prisma';
+import { adminDb } from './firebase-admin';
 import type { AdminFile, ChunkInfo, FileInfo, ManagedUser, NodeStatus, User } from '@/lib/types';
 
 const DATA_DIR = path.join(process.cwd(), '.nimbusfs');
@@ -46,48 +46,54 @@ export async function ensureInitialized() {
 }
 
 export async function getUserById(userId: string) {
-  return prisma.user.findUnique({ where: { id: userId } });
+  const userDoc = await adminDb.collection('users').doc(userId).get();
+  if (!userDoc.exists) return null;
+  return { id: userDoc.id, ...userDoc.data() } as any;
 }
 
 export async function listFilesForUser(userId: string): Promise<FileInfo[]> {
-  const files = await prisma.file.findMany({
-    where: { ownerId: userId },
-    include: { chunks: true },
-    orderBy: { uploadedAt: 'desc' },
-  });
+  const filesSnapshot = await adminDb.collection('files')
+    .where('ownerId', '==', userId)
+    .orderBy('uploadedAt', 'desc')
+    .get();
 
-  return files.map((f: any) => ({
-    id: f.id,
-    name: f.name,
-    size: f.size,
-    uploadedAt: f.uploadedAt.toISOString(),
-    chunks: f.chunks.map((c: any) => ({
-      id: c.id,
-      index: c.index,
-      nodeId: c.nodeId,
-      size: c.size,
-    })),
-  }));
+  return filesSnapshot.docs.map((doc) => {
+    const data = doc.data();
+    return {
+      id: doc.id,
+      name: data.name,
+      size: data.size,
+      ownerId: data.ownerId,
+      uploadedAt: data.uploadedAt instanceof Date ? data.uploadedAt.toISOString() : (data.uploadedAt?.toDate?.()?.toISOString() || new Date().toISOString()),
+      chunks: data.chunks || [],
+    };
+
+  });
 }
 
 export async function listNodeStatuses(): Promise<NodeStatus[]> {
-  const nodes = await prisma.node.findMany({
-    include: {
-      chunks: true,
-    },
-  });
+  const nodesSnapshot = await adminDb.collection('nodes').get();
+  const nodes = nodesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as any));
+
+  // For nodes, we need to calculate used storage from chunks
+  // In Firestore, we might want to store usedBytes on node for performance, but for now we query
+  const chunksSnapshot = await adminDb.collection('chunks').get();
+  const allChunks = chunksSnapshot.docs.map(doc => doc.data());
 
   return nodes.map((n: any) => {
-    const usedBytes = n.chunks.reduce((acc: number, c: any) => acc + c.size, 0);
+    const usedBytes = allChunks
+      .filter((c: any) => c.nodeId === n.id)
+      .reduce((acc: number, c: any) => acc + c.size, 0);
+
     return {
       id: n.id,
       name: n.name,
       status: n.status as 'online' | 'offline',
       storage: {
         used: Number((usedBytes / GIGABYTE).toFixed(2)),
-        total: Number((Number(n.capacityBytes) / GIGABYTE).toFixed(2)),
+        total: Number((n.capacityBytes / GIGABYTE).toFixed(2)),
       },
-      chunks: n.chunks.length,
+      chunks: allChunks.filter((c: any) => c.nodeId === n.id).length,
     };
   });
 }
@@ -103,64 +109,62 @@ export async function getHealthSummary() {
 }
 
 export async function listManagedUsers(): Promise<ManagedUser[]> {
-  const users = await prisma.user.findMany({
-    include: {
-      files: true,
-    },
-    orderBy: { createdAt: 'desc' },
-  });
+  const usersSnapshot = await adminDb.collection('users').orderBy('createdAt', 'desc').get();
+  const filesSnapshot = await adminDb.collection('files').get();
+  const allFiles = filesSnapshot.docs.map(doc => doc.data());
 
-  return users.map((u: any) => {
-    const storageUsed = u.files.reduce((acc: number, f: any) => acc + f.size, 0);
+  return usersSnapshot.docs.map((doc: any) => {
+    const u = doc.data();
+    const userFiles = allFiles.filter((f: any) => f.ownerId === doc.id);
+    const storageUsed = userFiles.reduce((acc: number, f: any) => acc + f.size, 0);
+
     return {
-      id: u.id,
+      id: doc.id,
       email: u.email,
       name: u.name || u.email,
       role: u.role as 'admin' | 'user',
       storageUsed,
-      filesCount: u.files.length,
-      lastActive: u.lastActive.toISOString(),
-      createdAt: u.createdAt.toISOString(),
+      filesCount: userFiles.length,
+      lastActive: u.lastActive instanceof Date ? u.lastActive.toISOString() : (u.lastActive?.toDate?.()?.toISOString() || new Date().toISOString()),
+      createdAt: u.createdAt instanceof Date ? u.createdAt.toISOString() : (u.createdAt?.toDate?.()?.toISOString() || new Date().toISOString()),
     };
   });
 }
 
 export async function listAdminFiles(): Promise<AdminFile[]> {
-  const files = await prisma.file.findMany({
-    include: {
-      owner: true,
-      chunks: {
-        include: {
-          node: true,
-        },
-      },
-    },
-    orderBy: { uploadedAt: 'desc' },
-  });
+  const filesSnapshot = await adminDb.collection('files').orderBy('uploadedAt', 'desc').get();
+  const usersSnapshot = await adminDb.collection('users').get();
+  const users = Object.fromEntries(usersSnapshot.docs.map(doc => [doc.id, doc.data()]));
 
-  return files.map((f: any) => ({
-    id: f.id,
-    name: f.name,
-    size: f.size,
-    owner: {
-      id: f.owner.id,
-      name: f.owner.name || f.owner.email,
-      email: f.owner.email,
-    },
-    uploadedAt: f.uploadedAt.toISOString(),
-    chunks: f.chunks.length,
-    nodes: Array.from(new Set(f.chunks.map((c: any) => c.node.name))),
-  }));
+  return filesSnapshot.docs.map((doc: any) => {
+    const f = doc.data();
+    const owner = users[f.ownerId] || { email: 'Unknown', name: 'Unknown' };
+
+    return {
+      id: doc.id,
+      name: f.name,
+      size: f.size,
+      owner: {
+        id: f.ownerId,
+        name: owner.name || owner.email,
+        email: owner.email,
+      },
+      uploadedAt: f.uploadedAt instanceof Date ? f.uploadedAt.toISOString() : (f.uploadedAt?.toDate?.()?.toISOString() || new Date().toISOString()),
+      chunks: f.chunks?.length || 0,
+      nodes: Array.from(new Set(f.chunks?.map((c: any) => c.nodeId) || [])),
+    };
+  });
 }
 
 export async function updateUserRole(userId: string, role: 'admin' | 'user') {
-  const user = await prisma.user.update({
-    where: { id: userId },
-    data: { role, lastActive: new Date() },
+  await adminDb.collection('users').doc(userId).update({
+    role,
+    lastActive: new Date(),
   });
 
+  const user = await getUserById(userId);
   return {
-    id: user.id,
+    id: userId,
     user: {
       email: user.email,
       name: user.name,
@@ -170,17 +174,22 @@ export async function updateUserRole(userId: string, role: 'admin' | 'user') {
 }
 
 export async function deleteUserAccount(userId: string) {
-  const userFiles = await prisma.file.findMany({ where: { ownerId: userId } });
+  const filesSnapshot = await adminDb.collection('files').where('ownerId', '==', userId).get();
 
-  await prisma.user.delete({ where: { id: userId } });
+  // Batch delete
+  const batch = adminDb.batch();
+  batch.delete(adminDb.collection('users').doc(userId));
 
-  for (const file of userFiles) {
+  for (const doc of filesSnapshot.docs) {
+    const file = doc.data();
+    batch.delete(doc.ref);
     const fullPath = path.join(UPLOAD_DIR, file.storagePath);
     if (await pathExists(fullPath)) {
       await unlink(fullPath);
     }
   }
 
+  await batch.commit();
   return userId;
 }
 
@@ -192,8 +201,13 @@ export async function createStoredFile(input: {
 }) {
   await ensureInitialized();
 
-  const onlineNodes = await prisma.node.findMany({ where: { status: 'online' } });
-  const targetNodes = onlineNodes.length > 0 ? onlineNodes : await prisma.node.findMany();
+  const nodesSnapshot = await adminDb.collection('nodes').where('status', '==', 'online').get();
+  let targetNodes = nodesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+  if (targetNodes.length === 0) {
+    const allNodesSnapshot = await adminDb.collection('nodes').get();
+    targetNodes = allNodesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  }
 
   if (targetNodes.length === 0) throw new Error('No storage nodes available.');
 
@@ -201,94 +215,97 @@ export async function createStoredFile(input: {
   const storedName = storageFileName(fileId, input.name);
   await writeFile(path.join(UPLOAD_DIR, storedName), input.buffer);
 
-  const fileCount = await prisma.file.count();
-  const chunkBlueprints = splitIntoChunks(input.buffer.byteLength, targetNodes.map((n: any) => n.id), fileCount);
+  const filesCountSnapshot = await adminDb.collection('files').count().get();
+  const fileCount = filesCountSnapshot.data().count;
+  const chunkBlueprints = splitIntoChunks(input.buffer.byteLength, targetNodes.map(n => n.id), fileCount);
 
-  const file = await prisma.file.create({
-    data: {
-      id: fileId,
-      ownerId: input.ownerId,
-      name: input.name,
-      size: input.buffer.byteLength,
-      mimeType: input.mimeType || 'application/octet-stream',
-      storagePath: storedName,
-      chunks: {
-        create: chunkBlueprints.map((cb: any) => ({
-          index: cb.index,
-          size: cb.size,
-          nodeId: cb.nodeId,
-        })),
-      },
-    },
-    include: {
-      chunks: true,
-    },
+  const chunks = chunkBlueprints.map((cb: any) => ({
+    id: randomUUID(),
+    index: cb.index,
+    size: cb.size,
+    nodeId: cb.nodeId,
+  }));
+
+  await adminDb.collection('files').doc(fileId).set({
+    ownerId: input.ownerId,
+    name: input.name,
+    size: input.buffer.byteLength,
+    mimeType: input.mimeType || 'application/octet-stream',
+    storagePath: storedName,
+    uploadedAt: new Date(),
+    chunks,
   });
 
-  await prisma.user.update({
-    where: { id: input.ownerId },
-    data: { lastActive: new Date() },
+  // Also store chunks in a separate collection for easier global querying
+  const batch = adminDb.batch();
+  for (const chunk of chunks) {
+    batch.set(adminDb.collection('chunks').doc(chunk.id), {
+      ...chunk,
+      fileId,
+    });
+  }
+  await batch.commit();
+
+  await adminDb.collection('users').doc(input.ownerId).update({
+    lastActive: new Date(),
   });
 
   return {
-    id: file.id,
-    name: file.name,
-    size: file.size,
-    uploadedAt: file.uploadedAt.toISOString(),
-    chunks: file.chunks.map((c: any) => ({
-      id: c.id,
-      index: c.index,
-      nodeId: c.nodeId,
-      size: c.size,
-    })),
+    id: fileId,
+    name: input.name,
+    size: input.buffer.byteLength,
+    uploadedAt: new Date().toISOString(),
+    chunks,
   };
 }
 
 export async function getStoredFile(fileId: string) {
-  const file = await prisma.file.findUnique({ where: { id: fileId } });
-  if (!file) return null;
+  const doc = await adminDb.collection('files').doc(fileId).get();
+  if (!doc.exists) return null;
 
-  const fullPath = path.join(UPLOAD_DIR, file.storagePath);
+  const file = doc.data();
+  const fullPath = path.join(UPLOAD_DIR, file!.storagePath);
   const buffer = await readFile(fullPath);
 
   return {
-    file,
+    file: { id: doc.id, ...file } as FileInfo,
     buffer,
   };
+
 }
 
 export async function deleteStoredFile(fileId: string) {
-  const file = await prisma.file.findUnique({ where: { id: fileId } });
-  if (!file) throw new Error('File not found.');
+  const doc = await adminDb.collection('files').doc(fileId).get();
+  if (!doc.exists) throw new Error('File not found.');
 
-  await prisma.file.delete({ where: { id: fileId } });
+  const file = doc.data();
 
-  const fullPath = path.join(UPLOAD_DIR, file.storagePath);
+  // Delete chunks first
+  const chunksSnapshot = await adminDb.collection('chunks').where('fileId', '==', fileId).get();
+  const batch = adminDb.batch();
+  chunksSnapshot.docs.forEach(doc => batch.delete(doc.ref));
+  batch.delete(doc.ref);
+  await batch.commit();
+
+  const fullPath = path.join(UPLOAD_DIR, file!.storagePath);
   if (await pathExists(fullPath)) {
     await unlink(fullPath);
   }
 
-  return file;
+  return { id: doc.id, ...file };
 }
 
 export async function authenticateUser(email: string, password: string) {
-  // Note: For real production, use bcrypt/argon2 to hash passwords.
-  // This project uses a simplified password check for the legacy login.
-  const user = await prisma.user.findUnique({ where: { email } });
+  const snapshot = await adminDb.collection('users').where('email', '==', email).limit(1).get();
+  if (snapshot.empty) return null;
 
-  // Since we migrated to Google Auth, we might not have a password for everyone.
-  // For demo purposes, we'll check if the user exists and has a password (this logic is for migration/demo).
-  // In a real app, you'd only use this for users who signed up with a password.
-  if (!user) return null;
+  const doc = snapshot.docs[0];
+  const user = doc.data();
 
-  // We'll update lastActive
-  await prisma.user.update({
-    where: { id: user.id },
-    data: { lastActive: new Date() }
-  });
+  await doc.ref.update({ lastActive: new Date() });
 
   return {
-    id: user.id,
+    id: doc.id,
     user: {
       email: user.email,
       name: user.name,
@@ -298,15 +315,13 @@ export async function authenticateUser(email: string, password: string) {
 }
 
 export async function updateUserProfile(userId: string, input: { email: string; name: string }) {
-  const user = await prisma.user.update({
-    where: { id: userId },
-    data: {
-      email: input.email,
-      name: input.name,
-      lastActive: new Date(),
-    },
+  await adminDb.collection('users').doc(userId).update({
+    email: input.email,
+    name: input.name,
+    lastActive: new Date(),
   });
 
+  const user = await getUserById(userId);
   return {
     email: user.email,
     name: user.name,
@@ -315,16 +330,19 @@ export async function updateUserProfile(userId: string, input: { email: string; 
 }
 
 export async function deleteAllFilesForUser(userId: string) {
-  const files = await prisma.file.findMany({ where: { ownerId: userId } });
+  const filesSnapshot = await adminDb.collection('files').where('ownerId', '==', userId).get();
+  const count = filesSnapshot.size;
 
-  await prisma.file.deleteMany({ where: { ownerId: userId } });
-
-  for (const file of files) {
+  const batch = adminDb.batch();
+  for (const doc of filesSnapshot.docs) {
+    const file = doc.data();
+    batch.delete(doc.ref);
     const fullPath = path.join(UPLOAD_DIR, file.storagePath);
     if (await pathExists(fullPath)) {
       await unlink(fullPath);
     }
   }
 
-  return files.length;
+  await batch.commit();
+  return count;
 }

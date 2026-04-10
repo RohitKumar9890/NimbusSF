@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { adminAuth } from '@/lib/server/firebase-admin';
+import { adminAuth, adminDb } from '@/lib/server/firebase-admin';
 import { createAuthToken } from '@/lib/server/session';
-import prisma from '@/lib/server/prisma';
+
 
 export const runtime = 'nodejs';
 
@@ -21,30 +21,29 @@ export async function POST(request: NextRequest) {
             return NextResponse.json({ message: 'Email not found in token' }, { status: 400 });
         }
 
-        // Upsert user in our database
-        // Note: We might want to check the user role here or assign a default
-        const user = await prisma.user.upsert({
-            where: { email },
-            update: {
-                name: name || email.split('@')[0],
-                lastActive: new Date(),
-            },
-            create: {
-                email,
-                name: name || email.split('@')[0],
-                role: 'user', // Default role
-            },
-        });
+        // Upsert user in Firestore
+        const userRef = adminDb.collection('users').doc(uid);
+        const userDoc = await userRef.get();
+
+        const userData = {
+            email,
+            name: name || email.split('@')[0],
+            lastActive: new Date(),
+            role: userDoc.exists ? userDoc.data()?.role || 'user' : 'user',
+            createdAt: userDoc.exists ? userDoc.data()?.createdAt : new Date(),
+        };
+
+        await userRef.set(userData, { merge: true });
 
         // Create session token
-        const token = createAuthToken(user.id);
+        const token = createAuthToken(uid);
 
         return NextResponse.json({
             token,
             user: {
-                email: user.email,
-                name: user.name,
-                role: user.role,
+                email,
+                name: userData.name,
+                role: userData.role,
             },
         });
     } catch (error: any) {
