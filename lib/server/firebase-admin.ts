@@ -9,9 +9,10 @@ if (!admin.apps.length) {
             clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
             privateKey: privateKey ? privateKey.replace(/\\n/g, '\n') : undefined,
         }),
+        storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET,
     });
 }
 
 export const adminAuth = admin.auth();
 export const adminDb = admin.firestore();
-
+export const adminStorage = admin.storage();

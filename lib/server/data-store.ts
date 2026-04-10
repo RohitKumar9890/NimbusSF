@@ -1,30 +1,11 @@
 import { randomUUID } from 'crypto';
-import { access, mkdir, readFile, unlink, writeFile } from 'fs/promises';
-import path from 'path';
-
-import { adminDb } from './firebase-admin';
+import { adminDb, adminStorage } from './firebase-admin';
 import type { AdminFile, ChunkInfo, FileInfo, ManagedUser, NodeStatus, User } from '@/lib/types';
 
-const DATA_DIR = path.join(process.cwd(), '.nimbusfs');
-const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 const GIGABYTE = 1024 * 1024 * 1024;
 
-async function pathExists(targetPath: string) {
-  try {
-    await access(targetPath);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function sanitizeFileName(name: string) {
-  return name.replace(/[^a-zA-Z0-9._-]/g, '_');
-}
-
-function storageFileName(fileId: string, originalName: string) {
-  return `${fileId}-${sanitizeFileName(originalName)}`;
-}
+// Helper to get the bucket
+const bucket = adminStorage.bucket();
 
 function splitIntoChunks(size: number, nodeIds: string[], offset = 0): Omit<ChunkInfo, 'id'>[] {
   if (nodeIds.length === 0) throw new Error('No storage nodes available.');
@@ -41,8 +22,7 @@ function splitIntoChunks(size: number, nodeIds: string[], offset = 0): Omit<Chun
 }
 
 export async function ensureInitialized() {
-  await mkdir(DATA_DIR, { recursive: true });
-  await mkdir(UPLOAD_DIR, { recursive: true });
+  // Firestore/Storage don't need local dir initialization
 }
 
 export async function getUserById(userId: string) {
@@ -63,11 +43,11 @@ export async function listFilesForUser(userId: string): Promise<FileInfo[]> {
       id: doc.id,
       name: data.name,
       size: data.size,
-      ownerId: data.ownerId,
       uploadedAt: data.uploadedAt instanceof Date ? data.uploadedAt.toISOString() : (data.uploadedAt?.toDate?.()?.toISOString() || new Date().toISOString()),
       chunks: data.chunks || [],
+      ownerId: data.ownerId,
+      mimeType: data.mimeType,
     };
-
   });
 }
 
@@ -75,8 +55,6 @@ export async function listNodeStatuses(): Promise<NodeStatus[]> {
   const nodesSnapshot = await adminDb.collection('nodes').get();
   const nodes = nodesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as any));
 
-  // For nodes, we need to calculate used storage from chunks
-  // In Firestore, we might want to store usedBytes on node for performance, but for now we query
   const chunksSnapshot = await adminDb.collection('chunks').get();
   const allChunks = chunksSnapshot.docs.map(doc => doc.data());
 
@@ -176,17 +154,14 @@ export async function updateUserRole(userId: string, role: 'admin' | 'user') {
 export async function deleteUserAccount(userId: string) {
   const filesSnapshot = await adminDb.collection('files').where('ownerId', '==', userId).get();
 
-  // Batch delete
   const batch = adminDb.batch();
   batch.delete(adminDb.collection('users').doc(userId));
 
   for (const doc of filesSnapshot.docs) {
     const file = doc.data();
     batch.delete(doc.ref);
-    const fullPath = path.join(UPLOAD_DIR, file.storagePath);
-    if (await pathExists(fullPath)) {
-      await unlink(fullPath);
-    }
+    const fileRef = bucket.file(file.storagePath);
+    await fileRef.delete().catch(() => { }); // Ignore if already deleted
   }
 
   await batch.commit();
@@ -199,8 +174,6 @@ export async function createStoredFile(input: {
   mimeType: string;
   buffer: Buffer;
 }) {
-  await ensureInitialized();
-
   const nodesSnapshot = await adminDb.collection('nodes').where('status', '==', 'online').get();
   let targetNodes = nodesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
 
@@ -212,8 +185,13 @@ export async function createStoredFile(input: {
   if (targetNodes.length === 0) throw new Error('No storage nodes available.');
 
   const fileId = randomUUID();
-  const storedName = storageFileName(fileId, input.name);
-  await writeFile(path.join(UPLOAD_DIR, storedName), input.buffer);
+  const storedPath = `uploads/${fileId}-${input.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+
+  // Upload to Firebase Storage
+  const fileRef = bucket.file(storedPath);
+  await fileRef.save(input.buffer, {
+    contentType: input.mimeType,
+  });
 
   const filesCountSnapshot = await adminDb.collection('files').count().get();
   const fileCount = filesCountSnapshot.data().count;
@@ -231,12 +209,11 @@ export async function createStoredFile(input: {
     name: input.name,
     size: input.buffer.byteLength,
     mimeType: input.mimeType || 'application/octet-stream',
-    storagePath: storedName,
+    storagePath: storedPath,
     uploadedAt: new Date(),
     chunks,
   });
 
-  // Also store chunks in a separate collection for easier global querying
   const batch = adminDb.batch();
   for (const chunk of chunks) {
     batch.set(adminDb.collection('chunks').doc(chunk.id), {
@@ -255,6 +232,7 @@ export async function createStoredFile(input: {
     name: input.name,
     size: input.buffer.byteLength,
     uploadedAt: new Date().toISOString(),
+    ownerId: input.ownerId,
     chunks,
   };
 }
@@ -264,14 +242,13 @@ export async function getStoredFile(fileId: string) {
   if (!doc.exists) return null;
 
   const file = doc.data();
-  const fullPath = path.join(UPLOAD_DIR, file!.storagePath);
-  const buffer = await readFile(fullPath);
+  const fileRef = bucket.file(file!.storagePath);
+  const [buffer] = await fileRef.download();
 
   return {
     file: { id: doc.id, ...file } as FileInfo,
     buffer,
   };
-
 }
 
 export async function deleteStoredFile(fileId: string) {
@@ -280,17 +257,14 @@ export async function deleteStoredFile(fileId: string) {
 
   const file = doc.data();
 
-  // Delete chunks first
   const chunksSnapshot = await adminDb.collection('chunks').where('fileId', '==', fileId).get();
   const batch = adminDb.batch();
   chunksSnapshot.docs.forEach(doc => batch.delete(doc.ref));
   batch.delete(doc.ref);
   await batch.commit();
 
-  const fullPath = path.join(UPLOAD_DIR, file!.storagePath);
-  if (await pathExists(fullPath)) {
-    await unlink(fullPath);
-  }
+  const fileRef = bucket.file(file!.storagePath);
+  await fileRef.delete().catch(() => { });
 
   return { id: doc.id, ...file };
 }
@@ -337,10 +311,8 @@ export async function deleteAllFilesForUser(userId: string) {
   for (const doc of filesSnapshot.docs) {
     const file = doc.data();
     batch.delete(doc.ref);
-    const fullPath = path.join(UPLOAD_DIR, file.storagePath);
-    if (await pathExists(fullPath)) {
-      await unlink(fullPath);
-    }
+    const fileRef = bucket.file(file.storagePath);
+    await fileRef.delete().catch(() => { });
   }
 
   await batch.commit();
