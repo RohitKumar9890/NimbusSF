@@ -1,0 +1,48 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+model User {
+  id         String   @id @default(uuid())
+  email      String   @unique
+  name       String?
+  role       String   @default("user")
+  lastActive DateTime @default(now())
+  createdAt  DateTime @default(now())
+  files      File[]
+}
+
+model Node {
+  id            String   @id @default(uuid())
+  name          String
+  status        String   @default("online")
+  capacityBytes Float
+  chunks        Chunk[]
+}
+
+model File {
+  id          String   @id @default(uuid())
+  ownerId     String
+  owner       User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  name        String
+  size        Int
+  uploadedAt  DateTime @default(now())
+  mimeType    String
+  storagePath String
+  chunks      Chunk[]
+}
+
+model Chunk {
+  id      String @id @default(uuid())
+  index   Int
+  nodeId  String
+  node    Node   @relation(fields: [nodeId], references: [id])
+  size    Int
+  fileId  String
+  file    File   @relation(fields: [fileId], references: [id], onDelete: Cascade)
+}
